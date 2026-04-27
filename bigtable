@@ -1,0 +1,320 @@
+# ============================================================
+# GCP Bigtable Terraform Module
+# ============================================================
+
+terraform {
+  required_version = ">= 1.3.0"
+  required_providers {
+    google = {
+      source  = "hashicorp/google"
+      version = ">= 4.60.0"
+    }
+  }
+}
+
+# ------------------------------------------------------------------
+# Bigtable Instance
+# ------------------------------------------------------------------
+resource "google_bigtable_instance" "this" {
+  name                = var.instance_name
+  project             = var.project_id
+  display_name        = var.display_name != "" ? var.display_name : var.instance_name
+  deletion_protection = var.deletion_protection
+
+  # Each cluster block represents one cluster inside the instance
+  dynamic "cluster" {
+    for_each = var.clusters
+    content {
+      cluster_id   = cluster.value.cluster_id
+      zone         = cluster.value.zone
+      storage_type = lookup(cluster.value, "storage_type", "SSD")
+
+      # Autoscaling (mutually exclusive with num_nodes)
+      dynamic "autoscaling_config" {
+        for_each = lookup(cluster.value, "autoscaling", null) != null ? [cluster.value.autoscaling] : []
+        content {
+          min_nodes      = autoscaling_config.value.min_nodes
+          max_nodes      = autoscaling_config.value.max_nodes
+          cpu_target     = autoscaling_config.value.cpu_target
+          storage_target = lookup(autoscaling_config.value, "storage_target", null)
+        }
+      }
+
+      # Static node count (only when autoscaling is NOT set)
+      num_nodes = lookup(cluster.value, "autoscaling", null) == null ? lookup(cluster.value, "num_nodes", 1) : null
+    }
+  }
+
+  labels = var.labels
+
+  lifecycle {
+    # Prevent accidental destruction of production instances
+    prevent_destroy = false # set to true in prod via override
+  }
+}
+
+# ------------------------------------------------------------------
+# Bigtable Tables
+# ------------------------------------------------------------------
+resource "google_bigtable_table" "this" {
+  for_each      = { for t in var.tables : t.name => t }
+  name          = each.value.name
+  instance_name = google_bigtable_instance.this.name
+  project       = var.project_id
+
+  # Deletion protection per table
+  deletion_protection = lookup(each.value, "deletion_protection", "PROTECTED")
+
+  # Column families
+  dynamic "column_family" {
+    for_each = lookup(each.value, "column_families", [])
+    content {
+      family = column_family.value
+    }
+  }
+}
+
+# ------------------------------------------------------------------
+# IAM Bindings (optional, per-instance)
+# ------------------------------------------------------------------
+resource "google_bigtable_instance_iam_binding" "this" {
+  for_each = var.iam_bindings
+
+  project  = var.project_id
+  instance = google_bigtable_instance.this.name
+  role     = each.key
+  members  = each.value
+}
+======================================================================================================================
+# ============================================================
+# Variables – GCP Bigtable Module
+# ============================================================
+
+variable "project_id" {
+  description = "GCP project ID where the Bigtable instance will be created."
+  type        = string
+}
+
+variable "instance_name" {
+  description = "Unique ID / name for the Bigtable instance (lowercase, hyphens allowed)."
+  type        = string
+}
+
+variable "display_name" {
+  description = "Human-readable display name. Defaults to instance_name if empty."
+  type        = string
+  default     = ""
+}
+
+variable "deletion_protection" {
+  description = "When true, Terraform cannot delete the instance."
+  type        = bool
+  default     = true
+}
+
+variable "clusters" {
+  description = <<-EOT
+    List of cluster configurations. Each object supports:
+      - cluster_id   (required) : unique ID within the instance
+      - zone         (required) : GCP zone, e.g. "us-central1-a"
+      - storage_type (optional) : "SSD" (default) or "HDD"
+      - num_nodes    (optional) : static node count (ignored when autoscaling is set)
+      - autoscaling  (optional) : object with min_nodes, max_nodes, cpu_target, storage_target
+  EOT
+  type = list(object({
+    cluster_id   = string
+    zone         = string
+    storage_type = optional(string, "SSD")
+    num_nodes    = optional(number, 1)
+    autoscaling = optional(object({
+      min_nodes      = number
+      max_nodes      = number
+      cpu_target     = number
+      storage_target = optional(number)
+    }))
+  }))
+
+  validation {
+    condition     = length(var.clusters) >= 1 && length(var.clusters) <= 4
+    error_message = "Bigtable instances require between 1 and 4 clusters."
+  }
+}
+
+variable "tables" {
+  description = <<-EOT
+    List of table definitions. Each object supports:
+      - name               (required) : table name
+      - column_families    (optional) : list of column family names
+      - deletion_protection(optional) : "PROTECTED" (default) or "UNPROTECTED"
+  EOT
+  type = list(object({
+    name                = string
+    column_families     = optional(list(string), [])
+    deletion_protection = optional(string, "PROTECTED")
+  }))
+  default = []
+}
+
+variable "iam_bindings" {
+  description = <<-EOT
+    Map of IAM role → list of members to bind at the instance level.
+    Example:
+      {
+        "roles/bigtable.reader" = ["serviceAccount:sa@project.iam.gserviceaccount.com"]
+        "roles/bigtable.user"   = ["group:devs@example.com"]
+      }
+  EOT
+  type    = map(list(string))
+  default = {}
+}
+
+variable "labels" {
+  description = "Labels to apply to the Bigtable instance."
+  type        = map(string)
+  default     = {}
+}
+=========================================================================
+# ============================================================
+# Outputs – GCP Bigtable Module
+# ============================================================
+
+output "instance_name" {
+  description = "The name of the Bigtable instance."
+  value       = google_bigtable_instance.this.name
+}
+
+output "instance_id" {
+  description = "The full resource ID of the Bigtable instance."
+  value       = google_bigtable_instance.this.id
+}
+
+output "table_names" {
+  description = "Map of logical table key → Bigtable table name."
+  value       = { for k, t in google_bigtable_table.this : k => t.name }
+}
+
+output "cluster_ids" {
+  description = "List of cluster IDs created inside the instance."
+  value       = [for c in var.clusters : c.cluster_id]
+}
+================================================================================
+
+# ============================================================
+# Example – calling the Bigtable module
+# ============================================================
+
+provider "google" {
+  project = var.project_id
+  region  = "us-central1"
+}
+
+# ── Single-cluster, SSD, static nodes (dev/staging) ──────────
+module "bigtable_dev" {
+  source = "./modules/bigtable"
+
+  project_id    = var.project_id
+  instance_name = "my-app-dev"
+  display_name  = "My App – Dev"
+
+  deletion_protection = false
+
+  clusters = [
+    {
+      cluster_id   = "my-app-dev-c1"
+      zone         = "us-central1-a"
+      storage_type = "SSD"
+      num_nodes    = 1
+    }
+  ]
+
+  tables = [
+    {
+      name            = "user-events"
+      column_families = ["cf1", "cf2"]
+    },
+    {
+      name            = "session-data"
+      column_families = ["meta", "payload"]
+    }
+  ]
+
+  labels = {
+    env     = "dev"
+    team    = "platform"
+    managed = "terraform"
+  }
+}
+
+# ── Multi-cluster, autoscaling, HDD (production) ─────────────
+module "bigtable_prod" {
+  source = "./modules/bigtable"
+
+  project_id    = var.project_id
+  instance_name = "my-app-prod"
+  display_name  = "My App – Production"
+
+  deletion_protection = true
+
+  clusters = [
+    {
+      cluster_id   = "prod-us-c1"
+      zone         = "us-central1-a"
+      storage_type = "SSD"
+      autoscaling = {
+        min_nodes      = 3
+        max_nodes      = 10
+        cpu_target     = 60
+        storage_target = 2560 # MB per node
+      }
+    },
+    {
+      cluster_id   = "prod-us-c2"
+      zone         = "us-east1-b"
+      storage_type = "SSD"
+      autoscaling = {
+        min_nodes  = 3
+        max_nodes  = 10
+        cpu_target = 60
+      }
+    }
+  ]
+
+  tables = [
+    {
+      name                = "user-events"
+      column_families     = ["cf1", "cf2"]
+      deletion_protection = "PROTECTED"
+    }
+  ]
+
+  iam_bindings = {
+    "roles/bigtable.reader" = [
+      "serviceAccount:reader-sa@${var.project_id}.iam.gserviceaccount.com"
+    ]
+    "roles/bigtable.user" = [
+      "serviceAccount:app-sa@${var.project_id}.iam.gserviceaccount.com"
+    ]
+  }
+
+  labels = {
+    env     = "prod"
+    team    = "platform"
+    managed = "terraform"
+  }
+}
+
+# ── Outputs ──────────────────────────────────────────────────
+output "dev_instance_name" {
+  value = module.bigtable_dev.instance_name
+}
+
+output "prod_instance_name" {
+  value = module.bigtable_prod.instance_name
+}
+
+output "prod_tables" {
+  value = module.bigtable_prod.table_names
+}
+
+
+
