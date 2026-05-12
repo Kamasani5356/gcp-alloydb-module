@@ -134,3 +134,51 @@ resource "google_compute_firewall" "allow_health_check" {
   # GCP health check IP ranges
   source_ranges = ["130.211.0.0/22", "35.191.0.0/16"]
 }
+
+
+
+
+
+# variables.tf
+
+variable "project_id" {
+  description = "GCP Project ID"
+  type        = string
+}
+
+variable "region" {
+  description = "GCP region"
+  type        = string
+  default     = "us-central1"
+}
+
+variable "name" {
+  description = "Name prefix for all resources"
+  type        = string
+  default     = "my-alb"
+}
+
+variable "domains" {
+  description = "Domains for managed SSL certificate"
+  type        = list(string)
+  default     = ["example.com"]
+}
+
+variable "instance_self_links" {
+  description = "Self-links of VM instances to add to the backend"
+  type        = list(string)
+  default     = []
+}
+
+
+# outputs.tf
+
+output "load_balancer_ip" {
+  description = "Public IP of the load balancer"
+  value       = google_compute_global_address.default.address
+}
+
+output "backend_service_id" {
+  description = "Backend service ID"
+  value       = google_compute_backend_service.default.id
+}
